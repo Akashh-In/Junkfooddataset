@@ -1,0 +1,22 @@
+path: /kaggle/working/yolo_food_only
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: biryani
+  1: Kabab
+  2: Mac and Cheese
+  3: Meatloaf
+  4: Muffin
+  5: Nachos
+  6: Cookies
+  7: French_Fry
+  8: Ice_Cream
+  9: Pizza
+  10: Processed_Cheese
+  11: cheesecake
+  12: crispychicken
+  13: sandwich
+  14: noodles
+  15: waffles
