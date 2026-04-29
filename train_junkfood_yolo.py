@@ -31,10 +31,6 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")          # headless — works on server / Colab
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import seaborn as sns
 
 from sklearn.metrics import (
     confusion_matrix,
@@ -46,7 +42,7 @@ from tqdm import tqdm
 # ── Config ────────────────────────────────────────────────────────────────────
 CFG = {
     # ---------- paths ----------
-    "dataset_root"  : "./Junkfooddataset",   # cloned repo root
+    "dataset_root"  : ".",                 # dataset root next to this script
     "data_yaml"     : "./data.yaml",
     "output_dir"    : "./runs/detect/junkfood_exp",
 
@@ -62,6 +58,12 @@ CFG = {
     "conf_thresh"   : 0.25,
     "iou_thresh"    : 0.45,
     "seed"          : 42,
+    "patience"      : 10,
+    "cache"         : False,
+    "val"           : True,
+    "fraction"      : 1.0,
+    "max_eval_images": 0,
+    "skip_extras"   : False,
 }
 
 # ── Argument overrides ────────────────────────────────────────────────────────
@@ -71,6 +73,22 @@ parser.add_argument("--model",   type=str,   default=CFG["model"])
 parser.add_argument("--batch",   type=int,   default=CFG["batch"])
 parser.add_argument("--imgsz",   type=int,   default=CFG["imgsz"])
 parser.add_argument("--device",  type=str,   default=CFG["device"])
+parser.add_argument("--patience", type=int,  default=CFG["patience"],
+                    help="Early stop patience (epochs)")
+parser.add_argument("--cache", action="store_true",
+                    help="Cache images in RAM for faster training")
+parser.add_argument("--no_val", action="store_true",
+                    help="Disable per-epoch validation (faster)")
+parser.add_argument("--fast", action="store_true",
+                    help="Speed-focused settings to fit a tight time budget")
+parser.add_argument("--fraction", type=float, default=CFG["fraction"],
+                    help="Fraction of training data to use (0-1)")
+parser.add_argument("--max_eval_images", type=int, default=CFG["max_eval_images"],
+                    help="Limit images used for custom confusion matrix (0=all)")
+parser.add_argument("--skip_extras", action="store_true",
+                    help="Skip extra plots/confusion matrix/sample predictions")
+parser.add_argument("--show", action="store_true",
+                    help="Show plots in GUI windows (requires Tk backend)")
 parser.add_argument("--eval_only", action="store_true",
                     help="Skip training; only run evaluation on best.pt")
 args = parser.parse_args()
@@ -80,10 +98,195 @@ CFG["model"]  = args.model
 CFG["batch"]  = args.batch
 CFG["imgsz"]  = args.imgsz
 CFG["device"] = args.device
+CFG["patience"] = args.patience
+CFG["cache"] = args.cache
+CFG["val"] = not args.no_val
+CFG["fraction"] = max(0.0, min(1.0, args.fraction))
+CFG["max_eval_images"] = max(0, args.max_eval_images)
+CFG["skip_extras"] = args.skip_extras
 EVAL_ONLY     = args.eval_only
+SHOW_PLOTS    = args.show
+
+if args.fast:
+    CFG["epochs"] = min(CFG["epochs"], 15)
+    CFG["imgsz"] = min(CFG["imgsz"], 512)
+    CFG["patience"] = min(CFG["patience"], 5)
+    CFG["val"] = False
+    CFG["cache"] = True
+    if CFG["fraction"] >= 1.0:
+        CFG["fraction"] = 0.5
+
+if SHOW_PLOTS:
+    try:
+        matplotlib.use("TkAgg")
+    except Exception as exc:
+        SHOW_PLOTS = False
+        matplotlib.use("Agg")
+        print(f"[WARN] GUI backend unavailable ({exc}). Falling back to file output.")
+else:
+    matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+
+
+def _pick_existing(candidates, must_be_dir=False):
+    """Return first existing candidate path, else None."""
+    for p in candidates:
+        p = Path(p)
+        if must_be_dir and p.is_dir():
+            return p.resolve()
+        if (not must_be_dir) and p.is_file():
+            return p.resolve()
+    return None
+
+
+def _looks_like_dataset_root(path):
+    """Return True when the path contains the expected YOLO split folders."""
+    path = Path(path)
+    return (
+        path.is_dir()
+        and (path / "images" / "train").is_dir()
+        and (path / "images" / "val").is_dir()
+        and (path / "labels" / "train").is_dir()
+        and (path / "labels" / "val").is_dir()
+    )
+
+
+def normalize_cfg_paths():
+    """Resolve config paths robustly (cwd + script-relative fallbacks)."""
+    script_dir = Path(__file__).resolve().parent
+    cwd = Path.cwd()
+
+    # dataset root
+    ds_raw = Path(CFG["dataset_root"])
+    ds_candidates = [
+        cwd,
+        script_dir,
+        cwd / ds_raw,
+        script_dir / ds_raw,
+        cwd / "Junkfooddataset",
+        script_dir / "Junkfooddataset",
+    ]
+    ds_found = next((p.resolve() for p in ds_candidates if _looks_like_dataset_root(p)), None)
+    if ds_found is not None:
+        CFG["dataset_root"] = str(ds_found)
+    else:
+        CFG["dataset_root"] = str(script_dir.resolve())
+
+    # data yaml
+    yaml_raw = Path(CFG["data_yaml"])
+    yaml_candidates = [
+        yaml_raw,
+        cwd / yaml_raw,
+        script_dir / yaml_raw,
+        Path(CFG["dataset_root"]) / "data.yaml",
+        cwd / "data.yaml",
+        script_dir / "data.yaml",
+    ]
+    yaml_found = _pick_existing(yaml_candidates, must_be_dir=False)
+    if yaml_found is not None:
+        CFG["data_yaml"] = str(yaml_found)
+    else:
+        CFG["data_yaml"] = str((script_dir / yaml_raw).resolve())
+
+    # output dir
+    out_raw = Path(CFG["output_dir"])
+    CFG["output_dir"] = str((out_raw if out_raw.is_absolute() else script_dir / out_raw).resolve())
+
+    print("\n[PATHS]")
+    print(f"  cwd          : {cwd}")
+    print(f"  script_dir   : {script_dir}")
+    print(f"  dataset_root : {CFG['dataset_root']}")
+    print(f"  data_yaml    : {CFG['data_yaml']}")
+    print(f"  output_dir   : {CFG['output_dir']}")
+
+
+def normalize_data_yaml():
+    """Normalize data.yaml into a resolved copy with valid paths."""
+    data_yaml = Path(CFG["data_yaml"])
+    if not data_yaml.exists():
+        script_dir = Path(__file__).resolve().parent
+        root = Path(CFG["dataset_root"])
+        checked = [
+            data_yaml,
+            script_dir / "data.yaml",
+            root / "data.yaml",
+            Path.cwd() / "data.yaml",
+        ]
+        msg = "\n".join([f"    - {p}" for p in checked])
+        sys.exit(
+            f"[ERROR] data.yaml not found. Checked:\n{msg}\n"
+            "  -> Fix CFG['data_yaml'] or place data.yaml in dataset root."
+        )
+
+    with open(data_yaml) as f:
+        meta = yaml.safe_load(f) or {}
+
+    class_names = meta.get("names", [])
+    if isinstance(class_names, dict):
+        class_names = [class_names[k] for k in sorted(class_names)]
+    elif not isinstance(class_names, list):
+        class_names = list(class_names) if class_names else []
+    meta["names"] = class_names
+    if "nc" not in meta:
+        meta["nc"] = len(class_names)
+
+    default_splits = {
+        "train": "images/train",
+        "val": "images/val",
+        "test": "images/test",
+    }
+    for split, default_path in default_splits.items():
+        if not meta.get(split):
+            meta[split] = default_path
+
+    base_dir = data_yaml.parent
+    candidates = []
+    if meta.get("path"):
+        root_path = Path(meta["path"])
+        if not root_path.is_absolute():
+            root_path = (base_dir / root_path).resolve()
+        candidates.append(root_path)
+    candidates.append(Path(CFG["dataset_root"]))
+    candidates.append(base_dir)
+
+    fixed_root = next((p.resolve() for p in candidates if _looks_like_dataset_root(p)), None)
+    if fixed_root is None:
+        fixed_root = Path(CFG["dataset_root"]).resolve()
+
+    meta["path"] = str(fixed_root)
+    CFG["dataset_root"] = str(fixed_root)
+
+    for split, default_path in default_splits.items():
+        split_val = meta.get(split)
+        split_path = Path(split_val)
+        if split_path.is_absolute():
+            if not split_path.exists():
+                candidate = fixed_root / default_path
+                if candidate.exists():
+                    meta[split] = default_path
+        else:
+            if not (fixed_root / split_path).exists():
+                candidate = fixed_root / default_path
+                if candidate.exists():
+                    meta[split] = default_path
+
+    resolved_yaml = OUT / "data_resolved.yaml"
+    with open(resolved_yaml, "w") as f:
+        yaml.safe_dump(meta, f, sort_keys=False)
+
+    CFG["data_yaml"] = str(resolved_yaml)
+    print(f"  data_yaml (resolved): {CFG['data_yaml']}")
+    return meta
+
+
+normalize_cfg_paths()
 
 OUT = Path(CFG["output_dir"])
 OUT.mkdir(parents=True, exist_ok=True)
+normalize_data_yaml()
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. DATASET SANITY CHECK
@@ -96,17 +299,59 @@ def check_dataset():
 
     data_yaml = Path(CFG["data_yaml"])
     if not data_yaml.exists():
-        sys.exit(f"[ERROR] data.yaml not found at: {data_yaml}\n"
-                 "  → Run: git clone https://github.com/Akashh-In/Junkfooddataset.git")
+        script_dir = Path(__file__).resolve().parent
+        root = Path(CFG["dataset_root"])
+        checked = [
+            data_yaml,
+            script_dir / "data.yaml",
+            root / "data.yaml",
+            Path.cwd() / "data.yaml",
+        ]
+        msg = "\n".join([f"    - {p}" for p in checked])
+        sys.exit(
+            f"[ERROR] data.yaml not found. Checked:\n{msg}\n"
+            "  → Fix CFG['data_yaml'] or place data.yaml in dataset root."
+        )
 
     with open(data_yaml) as f:
         meta = yaml.safe_load(f)
 
     class_names = meta.get("names", [])
+    if isinstance(class_names, dict):
+        class_names = [class_names[k] for k in sorted(class_names)]
+    elif not isinstance(class_names, list):
+        class_names = list(class_names) if class_names else []
     nc          = meta.get("nc", len(class_names))
     print(f"  Classes ({nc}): {class_names}")
 
     root = Path(CFG["dataset_root"])
+    required_dirs = [
+        root / "images" / "train",
+        root / "images" / "val",
+        root / "labels" / "train",
+        root / "labels" / "val",
+    ]
+    missing = [p for p in required_dirs if not p.exists()]
+    if missing:
+        msg = "\n".join([f"    - {p}" for p in missing])
+        sys.exit(
+            f"[ERROR] Dataset folders not found. Missing:\n{msg}\n"
+            "  -> Check data.yaml 'path' and local dataset layout."
+        )
+
+    # Validate split paths defined inside data.yaml (relative paths supported)
+    yaml_base = Path(meta.get("path", data_yaml.parent))
+    if not yaml_base.is_absolute():
+        yaml_base = (data_yaml.parent / yaml_base).resolve()
+    for split in ["train", "val", "test"]:
+        split_path = meta.get(split)
+        if split_path:
+            p = Path(split_path)
+            if not p.is_absolute():
+                p = (yaml_base / p).resolve()
+            if not p.exists():
+                print(f"[WARN] data.yaml '{split}' path does not exist: {p}")
+
     for split in ["train", "val", "test"]:
         img_dir = root / "images" / split
         lbl_dir = root / "labels" / split
@@ -114,6 +359,8 @@ def check_dataset():
             imgs   = list(img_dir.glob("*.*"))
             labels = list(lbl_dir.glob("*.txt")) if lbl_dir.exists() else []
             print(f"  {split:5s} → {len(imgs):4d} images | {len(labels):4d} labels")
+        else:
+            print(f"[WARN] Missing images directory: {img_dir}")
 
     return class_names, nc
 
@@ -143,6 +390,10 @@ def train():
         name        = OUT.name,
         exist_ok    = True,
         seed        = CFG["seed"],
+        patience    = CFG["patience"],
+        cache       = CFG["cache"],
+        val         = CFG["val"],
+        fraction    = CFG["fraction"],
         verbose     = True,
     )
     print(f"\n  ✔ Training complete → {OUT}")
@@ -206,6 +457,9 @@ def build_confusion_matrix(class_names):
     best_pt  = OUT / "weights" / "best.pt"
     val_imgs = sorted((Path(CFG["dataset_root"]) / "images" / "val").glob("*.*"))
     val_lbls = Path(CFG["dataset_root"]) / "labels" / "val"
+
+    if CFG["max_eval_images"] > 0 and len(val_imgs) > CFG["max_eval_images"]:
+        val_imgs = val_imgs[:CFG["max_eval_images"]]
 
     if not val_imgs:
         print("[WARN] No val images found — skipping confusion matrix.")
@@ -281,6 +535,8 @@ def build_confusion_matrix(class_names):
 
     save_path = OUT / "custom_confusion_matrix.png"
     plt.savefig(save_path, dpi=150)
+    if SHOW_PLOTS:
+        plt.show()
     plt.close()
     print(f"  ✔ Confusion matrix saved → {save_path}")
 
@@ -345,6 +601,8 @@ def plot_training_curves():
     plt.suptitle("Training & Validation Loss", fontsize=14, y=1.01)
     plt.tight_layout()
     plt.savefig(OUT / "loss_curves.png", dpi=150, bbox_inches="tight")
+    if SHOW_PLOTS:
+        plt.show()
     plt.close()
     print(f"  ✔ Loss curves saved → {OUT}/loss_curves.png")
 
@@ -368,6 +626,8 @@ def plot_training_curves():
     plt.suptitle("Validation Metrics over Epochs", fontsize=14, y=1.01)
     plt.tight_layout()
     plt.savefig(OUT / "metric_curves.png", dpi=150, bbox_inches="tight")
+    if SHOW_PLOTS:
+        plt.show()
     plt.close()
     print(f"  ✔ Metric curves saved → {OUT}/metric_curves.png")
 
@@ -460,6 +720,11 @@ def save_sample_predictions(class_names, n=16):
 
     save_path = OUT / "sample_predictions.png"
     grid.save(save_path)
+    if SHOW_PLOTS:
+        try:
+            grid.show()
+        except Exception as exc:
+            print(f"[WARN] Unable to open image viewer ({exc}).")
     print(f"  ✔ Sample predictions saved → {save_path}")
 
 
@@ -503,6 +768,8 @@ def plot_class_distribution(class_names):
     ax.grid(axis="y", alpha=0.3)
     plt.tight_layout()
     plt.savefig(OUT / "class_distribution.png", dpi=150)
+    if SHOW_PLOTS:
+        plt.show()
     plt.close()
     print(f"  ✔ Class distribution saved → {OUT}/class_distribution.png")
 
@@ -553,17 +820,21 @@ if __name__ == "__main__":
     _, metrics = validate(class_names)
 
     # ── Confusion matrix ──────────────────────────────────────────────────────
-    print("\n[4/6] Building confusion matrix …")
-    build_confusion_matrix(class_names)
+    if CFG["skip_extras"]:
+        print("\n[4/6] Skipping extra plots/predictions (--skip_extras).")
+    else:
+        # ── Confusion matrix ──────────────────────────────────────────────────────
+        print("\n[4/6] Building confusion matrix …")
+        build_confusion_matrix(class_names)
 
-    # ── Training curves ───────────────────────────────────────────────────────
-    print("\n[5/6] Plotting training curves …")
-    plot_training_curves()
-    plot_pr_curve(class_names)
+        # ── Training curves ───────────────────────────────────────────────────────
+        print("\n[5/6] Plotting training curves …")
+        plot_training_curves()
+        plot_pr_curve(class_names)
 
-    # ── Sample predictions ────────────────────────────────────────────────────
-    print("\n[6/6] Saving sample predictions …")
-    save_sample_predictions(class_names, n=16)
+        # ── Sample predictions ────────────────────────────────────────────────────
+        print("\n[6/6] Saving sample predictions …")
+        save_sample_predictions(class_names, n=16)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print_summary(metrics, class_names)

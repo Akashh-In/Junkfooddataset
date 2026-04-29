@@ -1,0 +1,22 @@
+path: C:\Users\ASUS\Downloads\Junk_food_detection\yolo_food_only
+train: images/train
+val: images/val
+test: images/test
+names:
+- biryani
+- Kabab
+- Mac and Cheese
+- Meatloaf
+- Muffin
+- Nachos
+- Cookies
+- French_Fry
+- Ice_Cream
+- Pizza
+- Processed_Cheese
+- cheesecake
+- crispychicken
+- sandwich
+- noodles
+- waffles
+nc: 16

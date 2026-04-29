@@ -1,0 +1,22 @@
+                  precision    recall  f1-score   support
+
+         biryani       0.00      0.00      0.00         0
+           Kabab       1.00      1.00      1.00       127
+  Mac and Cheese       1.00      1.00      1.00        62
+        Meatloaf       1.00      1.00      1.00        40
+          Muffin       0.98      1.00      0.99       121
+          Nachos       1.00      1.00      1.00        42
+         Cookies       1.00      0.99      1.00       125
+      French_Fry       0.98      1.00      0.99        55
+       Ice_Cream       0.98      0.94      0.96        66
+           Pizza       1.00      1.00      1.00        49
+Processed_Cheese       1.00      0.96      0.98        45
+      cheesecake       1.00      1.00      1.00        62
+   crispychicken       0.97      0.99      0.98       103
+        sandwich       0.99      0.99      0.99        68
+         noodles       1.00      1.00      1.00        63
+         waffles       1.00      1.00      1.00        75
+
+        accuracy                           0.99      1103
+       macro avg       0.93      0.93      0.93      1103
+    weighted avg       0.99      0.99      0.99      1103
